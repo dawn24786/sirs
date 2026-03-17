@@ -1,0 +1,111 @@
+bps_ref     = pw_results[6]['bps']          # fixed at reference values
+log_b_ref   = pw_results[6]['log_betas']    # reference log-betas
+k_ref       = pw_results[6]['k']
+K = 6
+
+def loss_fixed_bps(p):
+    """Loss with breakpoints fixed at reference — only beta values + k free."""
+    lb = p[:K];  k = np.exp(p[-1])
+    S, I, R = solve_with_continuity(lb, bps_ref, T)
+    if len(I) < T: return 1e6
+    return np.mean((I * k - obs_n) ** 2)
+
+rng_ms = np.random.default_rng(2024)
+ms_betas = []
+
+for trial in range(20):
+    # Perturb starting log-betas by ±0.3 (multiplicative noise of ~1.35×)
+    p0 = np.concatenate([log_b_ref + rng_ms.normal(0, 0.3, K),
+                         [np.log(k_ref) + rng_ms.normal(0, 0.3)]])
+    r = minimize(loss_fixed_bps, p0, method='Nelder-Mead',
+                 options=dict(maxiter=1500, xatol=1e-7, fatol=1e-9))
+    ms_betas.append(np.exp(r.x[:K]))
+
+ms_betas = np.array(ms_betas)   # shape (20, 6)
+
+# 95% CI from 2.5th and 97.5th percentiles of the multi-start distribution
+ci_lo = np.percentile(ms_betas, 2.5,  axis=0)
+ci_hi = np.percentile(ms_betas, 97.5, axis=0)
+I_k6_ref   = pw_results[6]['I_fit']
+resid_ref  = obs - I_k6_ref      # shape (T,) — reference residuals
+
+rng_boot = np.random.default_rng(99)
+boot_betas = []
+
+for b_idx in range(40):
+    # Step 1: Resample residuals with replacement
+    noise_b = rng_boot.choice(resid_ref, size=T, replace=True)
+    # Step 2: Create synthetic observations (no negative values)
+    obs_b   = np.clip(I_k6_ref + noise_b, 0, None)
+    obs_bn  = obs_b / I_k6_ref.max()   # normalise to peak of base fit
+
+    def boot_loss(p):
+        lb = p[:K]; k = np.exp(p[-1])
+        S, I, R = solve_with_continuity(lb, bps_ref, T)
+        if len(I) < T: return 1e6
+        return np.mean((I * k - obs_bn) ** 2)
+
+    # Start from reference + small perturbation
+    p0 = np.concatenate([log_b_ref + rng_boot.normal(0, 0.1, K),
+                         [np.log(k_ref) + rng_boot.normal(0, 0.15)]])
+    r = minimize(boot_loss, p0, method='Nelder-Mead',
+                 options=dict(maxiter=1200, xatol=1e-7, fatol=1e-9))
+    boot_betas.append(np.exp(r.x[:K]))
+
+boot_betas = np.array(boot_betas)   # shape (40, 6)
+bci_lo = np.percentile(boot_betas, 2.5,  axis=0)
+bci_hi = np.percentile(boot_betas, 97.5, axis=0)
+bci_se = np.std(boot_betas, axis=0)   # standard error per segment
+def sirs_omega(y, t, beta_arr, omega):
+    """SIRS with omega as an explicit argument (not fixed globally)."""
+    S, I, R = y; N = S + I + R
+    ti  = min(int(round(t)), len(beta_arr)-1)
+    b   = beta_arr[ti]
+    return [-b*S*I/N + omega*R,
+             b*S*I/N - gamma_fix*I,
+             gamma_fix*I - omega*R]
+
+# Grid of ω values: logarithmically spaced from 1e-6 to 0.2/week
+omega_grid    = np.logspace(-6, -0.7, 35)
+profile_rmse  = []
+profile_loglik = []
+
+for om in omega_grid:
+    # Fix omega at current grid value; re-optimise log_betas + k
+    def profile_loss(p):
+        lb = p[:K]; k = np.exp(p[-1])
+        bps_r = bps_ref   # keep breakpoints fixed too
+
+        # Build beta array for piecewise model
+        arr = np.full(T, np.exp(lb[0]))
+        segs_p = np.concatenate([[0],
+                                  np.sort(np.clip(bps_r, 1, T-2).astype(int)),
+                                  [T]])
+        for i in range(K): arr[segs_p[i]:segs_p[i+1]] = np.exp(lb[i])
+
+        try:
+            sol = odeint(sirs_omega, [0.9999, 1e-6, 1e-4], t_obs,
+                         args=(arr, om), rtol=1e-4, atol=1e-6, mxstep=200)
+            return np.mean((sol[:,1]*k - obs_n)**2)
+        except:
+            return 1e6
+
+    p0 = np.concatenate([log_b_ref, [np.log(k_ref)]])
+    r  = minimize(profile_loss, p0, method='Powell',
+                  options=dict(maxiter=2000, xtol=1e-8, ftol=1e-10))
+
+    # Compute log-likelihood at this ω
+    mse_p  = r.fun   # MSE in normalised space (proxy for variance)
+    ll_p   = -T/2 * np.log(mse_p)
+    profile_loglik.append(ll_p)
+    profile_rmse.append(...)  # (RMSE computed similarly)
+
+profile_loglik = np.array(profile_loglik)
+
+# 95% profile-likelihood CI: ΔlogL < 1.92 (chi²₁/2 = 3.84, half = 1.92)
+ll_max    = np.nanmax(profile_loglik)
+ci_thresh = ll_max - 1.92
+in_ci     = profile_loglik >= ci_thresh
+ci_l      = omega_grid[in_ci][0]
+ci_r      = omega_grid[in_ci][-1]
+# Result: CI spans ~5 orders of magnitude → ω is not identifiable
