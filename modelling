@@ -1,0 +1,372 @@
+from scipy.integrate import odeint
+from scipy.optimize import minimize
+import numpy as np
+
+# ── Global constants ──────────────────────────────────────────────────────────
+I_scale = obs.max()           # peak smoothed cases ≈ 1.03M
+obs_n   = obs / I_scale       # normalised observations, range [0,1]
+t_obs   = np.arange(T, dtype=float)
+
+# ── SIRS ODE right-hand side ──────────────────────────────────────────────────
+def sirs_const(y, t, beta, gamma, omega):
+    """
+    y     : [S, I, R] compartment fractions (sum ≈ 1)
+    t     : time (weeks) — not used explicitly since beta is constant
+    beta  : transmission rate (/week)
+    gamma : recovery rate (/week)  → mean infectious period = 1/gamma
+    omega : immunity loss rate (/week) → mean immunity duration = 1/omega
+    """
+    S, I, R = y
+    N = S + I + R   # should equal 1 but kept for numerical safety
+    dS = -beta * S * I / N  +  omega * R
+    dI = +beta * S * I / N  -  gamma * I
+    dR = +gamma * I          -  omega * R
+    return [dS, dI, dR]
+
+# ── Loss function ─────────────────────────────────────────────────────────────
+def ode_loss(log_params):
+    """
+    Parameters are log-transformed so optimiser works in unconstrained space:
+    log_params = [log(beta), log(gamma), log(omega), log(k)]
+    Taking exp() ensures all parameters remain strictly positive.
+    """
+    beta, gamma, omega, k = np.exp(log_params)
+
+    # Solve ODE from fixed initial conditions
+    # S0=0.9999: nearly all susceptible at start of pandemic
+    # I0=1e-6:   tiny seed infection
+    # R0=1e-4:   negligible prior immunity
+    try:
+        sol = odeint(sirs_const, [0.9999, 1e-6, 1e-4],
+                     t_obs,
+                     args=(beta, gamma, omega),
+                     rtol=1e-6, atol=1e-8)
+    except Exception:
+        return 1e6   # penalise solver failures
+
+    # I(t) from ODE is a population fraction; multiply by k to map to obs scale
+    # k absorbs: (i) population size, (ii) ascertainment rate, (iii) other scaling
+    I_pred = sol[:, 1] * k   # normalised prediction
+
+    # Mean squared error in normalised space
+    return np.mean((I_pred - obs_n) ** 2)
+
+# ── Multi-start optimisation ───────────────────────────────────────────────────
+# Single starting point often gets stuck in local minima for non-convex problems.
+# We run 45 random starts and keep the best result.
+rng = np.random.default_rng(2024)
+best_result = None
+best_loss   = np.inf
+
+for _ in range(45):
+    # Random starting point: perturb log-params around epidemiologically
+    # plausible values (beta~0.4, gamma~0.33, omega~1e-5, k~0.01)
+    p0 = np.array([np.log(0.4), np.log(0.33), np.log(1e-5), np.log(0.01)])
+    p0 += rng.normal(0, 0.5, 4)   # ±0.5 in log space = roughly ×1.65 perturbation
+
+    # Stage 1: Nelder-Mead (gradient-free, good for rough landscapes)
+    r1 = minimize(ode_loss, p0, method='Nelder-Mead',
+                  options=dict(maxiter=3000, xatol=1e-9, fatol=1e-11))
+
+    # Stage 2: Powell polish (coordinate-descent, tightens the solution)
+    r2 = minimize(ode_loss, r1.x, method='Powell',
+                  options=dict(maxiter=2000, xtol=1e-10, ftol=1e-12))
+
+    if r2.fun < best_loss:
+        best_loss   = r2.fun
+        best_result = r2
+
+# ── Extract fitted parameters ─────────────────────────────────────────────────
+beta_fit, gamma_fit, omega_fit, k_fit = np.exp(best_result.x)
+# R₀ = beta/gamma (basic reproduction number at start of epidemic)
+R0 = beta_fit / gamma_fit
+
+# ── Compute fit quality ────────────────────────────────────────────────────────
+sol_fit  = odeint(sirs_const, [0.9999, 1e-6, 1e-4], t_obs,
+                  args=(beta_fit, gamma_fit, omega_fit))
+I_fit    = sol_fit[:, 1] * k_fit * I_scale    # back to case counts
+residuals = obs - I_fit
+rmse      = np.sqrt(np.mean(residuals**2))
+ss_res    = np.sum(residuals**2)
+ss_tot    = np.sum((obs - obs.mean())**2)
+r2        = 1 - ss_res / ss_tot
+
+# AIC/BIC: model selection criteria
+# AIC = 2k − 2*log(L)  where L is the Gaussian log-likelihood
+# BIC = k*log(n) − 2*log(L)
+n_params  = 4
+mse       = np.mean(residuals**2)
+log_lik   = -T / 2 * np.log(mse)   # Gaussian log-likelihood
+aic       = 2 * n_params - 2 * log_lik
+bic       = np.log(T) * n_params - 2 * log_lik
+
+# Save parameters for later use
+np.save('p_ode.npy', best_result.x)        # log-params
+np.save('I_ode.npy', I_fit)                # fitted trajectory
+np.save('SIR_ode.npy', sol_fit)            # full S/I/R solution
+# ── Network architecture ──────────────────────────────────────────────────────
+# Input:  t (scalar, normalised to [0,1])
+# Hidden: 1 → 16 → 32 → 16
+# Output: 3 nodes → softmax → (S, I, R) — softmax ensures S+I+R=1 always
+
+ARCH = [1, 16, 32, 16, 3]   # layer sizes
+
+def count_params(arch):
+    """Count total parameters: for each layer, W has (in×out) entries, b has (out) entries."""
+    return sum((arch[i] + 1) * arch[i+1] for i in range(len(arch)-1))
+
+N_PARAMS = count_params(ARCH)   # 1,155 parameters
+
+def forward_pass(t_pts, params, arch=ARCH):
+    """
+    t_pts : shape (N,) — normalised time values in [0,1]
+    params: flat 1D array of all network weights and biases
+    Returns: shape (N, 3) — softmax output representing (S%, I%, R%)
+    """
+    idx = 0
+    h   = t_pts.reshape(-1, 1)   # (N, 1) — column vector input
+
+    for i in range(len(arch) - 1):
+        n_in, n_out = arch[i], arch[i+1]
+
+        # Unpack weight matrix W (n_out × n_in) and bias b (n_out,)
+        W   = params[idx : idx + n_in*n_out].reshape(n_out, n_in)
+        b   = params[idx + n_in*n_out : idx + n_in*n_out + n_out]
+        idx += n_in*n_out + n_out
+
+        # Linear transform: h = h @ W.T + b
+        h = h @ W.T + b
+
+        # Apply activation: tanh for hidden layers, softmax for output
+        if i < len(arch) - 2:
+            h = np.tanh(h)
+        else:
+            # Numerically stable softmax: subtract max before exp
+            e = np.exp(h - h.max(axis=1, keepdims=True))
+            h = e / e.sum(axis=1, keepdims=True)
+
+    return h   # shape (N, 3)
+
+# ── Central finite differences for dSIR/dt ────────────────────────────────────
+def d_dt(t_pts, params, eps=0.05):
+    """
+    Approximate time derivatives using central differences:
+    f'(t) ≈ [f(t+eps) − f(t−eps)] / (2*eps)
+    eps=0.05 in normalised time ≈ 8 weeks — smooths high-frequency noise
+    """
+    return (forward_pass(t_pts + eps, params) -
+            forward_pass(t_pts - eps, params)) / (2 * eps)
+
+# ── Normalised time axis ───────────────────────────────────────────────────────
+t_n = t_obs / t_obs.max()   # map [0, 162] → [0, 1]
+
+# ── PINN loss function ─────────────────────────────────────────────────────────
+def pinn_loss(x, lam_phys=1.0):
+    """
+    x: flat vector [network_params (1155), log_beta, log_gamma, log_omega, log_k]
+    lam_phys: weight on physics term (higher = stronger physics constraint)
+    """
+    net_params = x[:N_PARAMS]
+    beta, gamma, omega = np.exp(x[N_PARAMS:N_PARAMS+3])
+    k = np.exp(x[-1])
+
+    # ── Data loss ─────────────────────────────────────────────────────────────
+    SIR    = forward_pass(t_n, net_params)        # (T, 3)
+    I_pred = SIR[:, 1] * k                        # normalised I × scale factor
+    L_data = np.mean((I_pred - obs_n) ** 2)       # MSE in normalised space
+
+    # ── Physics loss ──────────────────────────────────────────────────────────
+    dSIR = d_dt(t_n, net_params)                  # (T, 3) — derivatives
+    S, I, R = SIR[:, 0], SIR[:, 1], SIR[:, 2]
+    N = np.clip(S + I + R, 1e-8, None)            # prevent division by zero
+
+    # Compute the ODE right-hand side at each time point
+    ode_S = -beta * S * I / N  +  omega * R
+    ode_I = +beta * S * I / N  -  gamma * I
+    ode_R = +gamma * I          -  omega * R
+
+    # Physics residual: how much does the network's derivative disagree with ODE?
+    rS = dSIR[:, 0] - ode_S
+    rI = dSIR[:, 1] - ode_I
+    rR = dSIR[:, 2] - ode_R
+    L_phys = np.mean(rS**2 + rI**2 + rR**2)
+
+    return L_data + lam_phys * L_phys
+
+# ── Two-stage training ─────────────────────────────────────────────────────────
+rng2 = np.random.default_rng(42)
+x0   = rng2.normal(0, 0.05, N_PARAMS + 4)   # small random init
+
+# Stage 1: light physics weight — let data loss dominate first
+r1 = minimize(lambda x: pinn_loss(x, lam_phys=0.3), x0,
+              method='L-BFGS-B', options=dict(maxiter=800, ftol=1e-13))
+
+# Stage 2: heavier physics weight — enforce ODE consistency
+r2 = minimize(lambda x: pinn_loss(x, lam_phys=1.0), r1.x,
+              method='L-BFGS-B', options=dict(maxiter=800, ftol=1e-14))
+
+# ── Extract PINN results ───────────────────────────────────────────────────────
+xf         = r2.x
+net_params_f = xf[:N_PARAMS]
+beta_pinn, gamma_pinn, omega_pinn = np.exp(xf[N_PARAMS:N_PARAMS+3])
+k_pinn     = np.exp(xf[-1])
+
+SIR_pinn   = forward_pass(t_n, net_params_f)
+I_pinn     = SIR_pinn[:, 1] * k_pinn * I_scale
+T_ext = T + 26              # extend 26 weeks beyond data
+t_ext = np.arange(T_ext, dtype=float)
+
+# ── ODE forward simulation ─────────────────────────────────────────────────────
+# Use parameters from PINN (could use ODE parameters — nearly identical R₀)
+# Initial condition: first point of PINN-learned SIR trajectory
+S0_fwd = float(SIR_pinn[0, 0])
+I0_fwd = float(SIR_pinn[0, 1])
+
+sol_fwd = odeint(sirs_const, [S0_fwd, I0_fwd, 1-S0_fwd-I0_fwd],
+                 t_ext,
+                 args=(beta_pinn, gamma_pinn, omega_pinn))
+I_ode_fwd = sol_fwd[:, 1] * k_pinn * I_scale
+
+# ── PINN MLP extrapolation ─────────────────────────────────────────────────────
+# Evaluate the trained network on time points beyond training range
+# t_ext_n goes beyond [0,1] — the network has no seen these values
+t_ext_n    = t_ext / t_obs.max()   # max normalised value > 1 for extension
+SIR_pinn_ext = forward_pass(t_ext_n, net_params_f)
+I_pinn_ext   = SIR_pinn_ext[:, 1] * k_pinn * I_scale
+
+# The ODE forward decays gracefully (epidemic dies out)
+# The PINN extrapolation diverges (neural networks don't generalise outside
+# their training distribution — they have no structural knowledge of R₀ < 1
+# causing epidemic extinction)
+from scipy.integrate import odeint
+from scipy.optimize import minimize
+
+gamma_fix = np.exp(p_ode[1])   # fixed at ODE baseline value: 0.3359/wk
+omega_fix = np.exp(p_ode[2])   # fixed at ODE baseline: ~1e-5/wk
+
+def sirs_seg(y, t, beta_val):
+    """SIRS ODE for a single segment with constant beta_val."""
+    S, I, R = y;  N = S + I + R
+    return [
+        -beta_val*S*I/N + omega_fix*R,
+         beta_val*S*I/N - gamma_fix*I,
+         gamma_fix*I    - omega_fix*R
+    ]
+
+def solve_with_continuity(log_betas, bps, T,
+                          S0=0.9999, I0=1e-6):
+    """
+    Solve SIRS piecewise, enforcing state continuity at each breakpoint.
+
+    log_betas : array of K log(β) values, one per segment
+    bps       : array of K-1 breakpoint positions (week indices, possibly float)
+    Returns   : arrays S(t), I(t), R(t) of length T
+    """
+    # Sort and clip breakpoints to valid integer week indices
+    bps_i = np.sort(np.clip(np.array(bps), 1, T-2).astype(int))
+    # Build segment boundaries: [0, bp1, bp2, ..., T]
+    segs  = np.concatenate([[0], bps_i, [T]])
+
+    all_S, all_I, all_R = [], [], []
+    y_cur = [S0, I0, 1 - S0 - I0]   # initial condition
+
+    for si in range(len(segs) - 1):
+        t0, t1 = int(segs[si]), int(segs[si+1])
+        if t1 <= t0:
+            continue
+
+        # Local time axis for this segment (starts at 0)
+        t_seg    = t_obs[t0:t1] - t_obs[t0]
+        beta_val = float(np.exp(log_betas[si]))
+
+        # Solve ODE on this segment from current state y_cur
+        sol = odeint(sirs_seg, y_cur, t_seg,
+                     args=(beta_val,), rtol=1e-6, atol=1e-8, mxstep=500)
+
+        all_S.extend(sol[:, 0])
+        all_I.extend(sol[:, 1])
+        all_R.extend(sol[:, 2])
+
+        # ← ISSUE 7 KEY LINE: hand final state to next segment
+        y_cur = list(sol[-1])
+
+    return np.array(all_S), np.array(all_I), np.array(all_R)
+
+def pw_loss(p, K):
+    """
+    p = [log_beta_0, ..., log_beta_{K-1},   <- K transmission rates
+         bp_1, ..., bp_{K-1},               <- K-1 breakpoints (float)
+         log_k]                              <- observation scale
+    """
+    log_betas = p[:K]
+    bps       = p[K : K + K - 1]
+    k         = np.exp(p[-1])
+
+    S, I, R = solve_with_continuity(log_betas, bps, T)
+    if len(I) < T:
+        return 1e6   # solver failure penalty
+
+    I_pred = I * k
+    return np.mean((I_pred - obs_n) ** 2)
+
+# ── Fit K = 4, 6, 8 and compare ───────────────────────────────────────────────
+pw_results = {}
+
+for K in [4, 6, 8]:
+    rng3 = np.random.default_rng(K * 100)
+    best_r, best_loss = None, np.inf
+
+    for trial in range(30):   # 30 multi-starts per K
+        # Random initial log-betas around realistic range
+        lb0 = np.log(0.5) + rng3.normal(0, 0.3, K)
+        # Random initial breakpoints spread across the data range
+        bps0 = np.sort(rng3.uniform(10, T-10, K-1))
+        lk0  = np.array([np.log(0.01)])
+        p0   = np.concatenate([lb0, bps0, lk0])
+
+        r1 = minimize(lambda p: pw_loss(p, K), p0,
+                      method='Nelder-Mead',
+                      options=dict(maxiter=4000, xatol=1e-9, fatol=1e-11))
+        r2 = minimize(lambda p: pw_loss(p, K), r1.x,
+                      method='Powell',
+                      options=dict(maxiter=3000, xtol=1e-10, ftol=1e-12))
+
+        if r2.fun < best_loss:
+            best_loss = r2.fun
+            best_r    = r2
+
+    # ── Extract results ────────────────────────────────────────────────────────
+    betas_k  = np.exp(best_r.x[:K])
+    bps_k    = best_r.x[K : K+K-1]
+    k_k      = np.exp(best_r.x[-1])
+
+    S_k, I_k, R_k = solve_with_continuity(best_r.x[:K], bps_k, T)
+    I_fit_k  = I_k * k_k * I_scale
+    resid_k  = obs - I_fit_k
+    rmse_k   = np.sqrt(np.mean(resid_k**2))
+    r2_k     = 1 - np.sum(resid_k**2) / np.sum((obs - obs.mean())**2)
+
+    # Build the beta step-function array for plotting
+    beta_arr_k = np.full(T, betas_k[0])
+    segs_k = np.concatenate([[0],
+                              np.sort(np.clip(bps_k, 1, T-2).astype(int)),
+                              [T]])
+    for i in range(K):
+        beta_arr_k[segs_k[i]:segs_k[i+1]] = betas_k[i]
+
+    # AIC/BIC: K betas + K-1 breakpoints + 1 k = 2K parameters
+    n_p   = 2 * K
+    mse_k = np.mean(resid_k**2)
+    LL_k  = -T / 2 * np.log(mse_k)
+    aic_k = 2*n_p - 2*LL_k
+    bic_k = np.log(T)*n_p - 2*LL_k
+
+    pw_results[K] = dict(
+        log_betas=np.log(betas_k), bps=bps_k, k=k_k,
+        I_fit=I_fit_k, sol=np.stack([S_k, I_k, R_k], axis=1),
+        beta_arr=beta_arr_k, resid=resid_k,
+        rmse=rmse_k, r2=r2_k, aic=aic_k, bic=bic_k, n_params=n_p
+    )
+    print(f"K={K}: RMSE={rmse_k:,.0f}  R²={r2_k:.4f}  AIC={aic_k:.1f}  BIC={bic_k:.1f}")
+
+# K=6 wins on both AIC and BIC
