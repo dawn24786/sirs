@@ -27,3 +27,40 @@ uk_daily = uk_daily.clip(lower=0)
 # First convert index to DatetimeIndex so we can use resample()
 uk_daily.index = pd.to_datetime(uk_daily.index, format='%m/%d/%y')
 uk_weekly = uk_daily.resample('W-MON').sum()   # 163 weeks total
+from scipy.signal import savgol_filter
+
+# Raw counts as a numpy array
+obs_raw = uk_weekly.values.astype(float)  # shape: (163,)
+
+# Savitzky-Golay: window=11 weeks, polynomial degree=3
+# window must be odd; degree must be less than window
+# This smooths the series while preserving peak structure
+obs_smooth = savgol_filter(obs_raw, window_length=11, polyorder=3)
+
+# Clip any negative smoothed values (can occur at the start of the series)
+obs_smooth = np.clip(obs_smooth, 0, None)
+
+# 'obs' is our target for all model fitting going forward
+obs = obs_smooth   # shape: (163,)
+T   = len(obs)     # T = 163 weeks
+UK_POPULATION = 67_000_000   # 2021 ONS estimate
+
+# Per-100K transformation: divide by population, multiply by 100,000
+obs_per100k     = obs_raw    / UK_POPULATION * 1e5
+obs_sm_per100k  = obs_smooth / UK_POPULATION * 1e5
+
+# Week index: integer 0, 1, 2, ... 162
+# Used as the time axis for all models
+week_index = np.arange(T, dtype=float)   # shape: (163,)
+t_obs      = week_index.copy()           # alias used in ODE solver
+ Build the clean output dataframe
+df_clean = pd.DataFrame({
+    'week_start':           uk_weekly.index,
+    'uk_cases_raw':         obs_raw,
+    'uk_cases_smooth':      obs_smooth,
+    'uk_cases_raw_per100k': obs_per100k,
+    'uk_cases_smooth_per100k': obs_sm_per100k,
+    'week_index':           week_index.astype(int)
+})
+
+df_clean.to_csv('uk_weekly_cases_clean.csv', index=False)
