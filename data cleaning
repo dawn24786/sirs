@@ -1,0 +1,29 @@
+import pandas as pd
+import numpy as np
+
+# ── Load the raw JHU wide-format CSV ─────────────────────────────────────────
+df_raw = pd.read_csv('time_series_covid19_confirmed_global.csv')
+
+# Filter to UK rows only — JHU uses 'United Kingdom' as Country/Region
+# There are 15 sub-region rows (England, Scotland, Wales, N.Ireland, territories)
+uk = df_raw[df_raw['Country/Region'] == 'United Kingdom'].copy()
+
+# The date columns start at position 4 (after Province, Country, Lat, Long)
+date_cols = df_raw.columns[4:]
+
+# Sum all sub-regions into a single national cumulative series
+# axis=0 sums down rows for each date column
+uk_cumulative = uk[date_cols].sum(axis=0)  # shape: (1143,) — one value per day
+
+# Convert cumulative counts to daily new cases via first-difference
+# diff() subtracts each value from the previous one
+uk_daily = uk_cumulative.diff().fillna(0)
+
+# Clip negative values to 0 — these are data corrections in the JHU feed
+# (3 negative values found in the raw data)
+uk_daily = uk_daily.clip(lower=0)
+
+# Resample to weekly: sum Monday-to-Sunday blocks
+# First convert index to DatetimeIndex so we can use resample()
+uk_daily.index = pd.to_datetime(uk_daily.index, format='%m/%d/%y')
+uk_weekly = uk_daily.resample('W-MON').sum()   # 163 weeks total
